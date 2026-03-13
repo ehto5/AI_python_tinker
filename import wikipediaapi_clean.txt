@@ -1,0 +1,168 @@
+import wikipediaapi
+from transformers import AutoTokenizer
+from sentence_transformers import SentenceTransformer
+import time
+
+# Step 1: Fetch the Wikipedia article and section data
+def fetch_article(title):
+    wiki = wikipediaapi.Wikipedia(
+        language='en', 
+        user_agent='learning_python_test/1.0 (your_email@example.com)'
+    )  # Specify your custom user agent
+    page = wiki.page(title)
+    if page.exists():
+        return page.title, page.sections, page.text
+    else:
+        print("The page doesn't exist.")
+        return None, None, None
+
+
+# Step 2: Traverse sections to extract content and associate titles
+def extract_section_content(sections, section_prefix=""):
+    section_content = []
+    for section in sections:
+        # Combine parent and subsection titles for clarity
+        full_title = f"{section_prefix} > {section.title}" if section_prefix else section.title
+        print(f"Extracting Section: {full_title}")  # Debugging
+        print(f"Content: {section.text[:100]}...")  # Print the first 100 characters for brevity
+        section_content.append({
+            "section_title": full_title,
+            "content": section.text
+        })
+        # Recursively handle subsections
+        section_content.extend(extract_section_content(section.sections, full_title))
+    return section_content
+
+# Base URL for your local Kiwix instance - update this to match your setup
+KIWIX_BASE_URL = "http://localhost/viewer#wikipedia_en_all_maxi_2024-01/A/"
+ 
+# Step 3: Chunk the article with accurate metadata
+def chunk_article_with_metadata(article_title, section_data, token_limit, tokenizer, wikipedia_url):
+    chunks = []
+    for section in section_data:
+        section_title = section["section_title"]
+        sentences = section["content"].split(". ")  # Split section content into sentences
+        current_chunk = []
+        current_token_count = 0
+
+        for sentence in sentences:
+            # Tokenize the sentence and count tokens
+            tokenized = tokenizer(sentence, add_special_tokens=False)
+            token_count = len(tokenized['input_ids'])
+
+            # Check if adding the sentence would exceed the token limit
+            if current_token_count + token_count <= token_limit:
+                current_chunk.append(sentence)
+                current_token_count += token_count
+            else:
+                # Finalize the current chunk with metadata and reset
+                kiwix_url = f"{KIWIX_BASE_URL}{article_title.replace(' ', '_')}"
+                chunks.append({
+                    "content": " ".join(current_chunk),
+                    "metadata": {
+                        "article_title": article_title,
+                        "section_title": section_title,
+                        "kiwix_url": kiwix_url
+                    }
+                })
+                current_chunk = [sentence]
+                current_token_count = token_count
+
+        # Add the last chunk if it isn't empty
+        if current_chunk:
+            kiwix_url = f"{KIWIX_BASE_URL}{article_title.replace(' ', '_')}"
+            chunks.append({
+                "content": " ".join(current_chunk),
+                "metadata": {
+                    "article_title": article_title,
+                    "section_title": section_title,
+                    "kiwix_url": kiwix_url
+                }
+            })
+
+    return chunks
+
+# Step 4: Embed the chunks
+def embed_chunks(chunks, model_name):
+    from sentence_transformers import SentenceTransformer
+    import torch
+    import time
+
+    # Ensure the use of Intel XPU
+    device = "xpu" if torch.xpu.is_available() else "cpu"  # Check for Intel XPU
+    print(f"Using device: {device}")
+    model = SentenceTransformer(model_name, device=device)
+
+    # Prepare the content for embedding
+    chunk_texts = [chunk["content"] for chunk in chunks]
+
+    # Measure embedding time for benchmarking
+    start_time = time.time()
+    embeddings = model.encode(chunk_texts, convert_to_tensor=True, device=device)  # Ensure XPU usage here
+    end_time = time.time()
+
+    print(f"Embedding Time (seconds): {end_time - start_time}")
+    return embeddings
+
+from pymilvus import Collection, connections
+import random
+import time
+
+# Step 5: Insert chunks and embeddings into Milvus
+def insert_into_milvus(chunks, embeddings, collection_name):
+    # Connect to Milvus
+    connections.connect("default", host="localhost", port="19530")
+    
+    # Load the collection
+    collection = Collection(collection_name)
+    
+    # Prepare data for insertion
+    data = [
+        [f"chunk_{i+1}" for i in range(len(chunks))],  # chunk_id (e.g., "chunk_1", "chunk_2", ...)
+        [chunk["metadata"]["article_title"] for chunk in chunks],  # title
+        [chunk["metadata"]["section_title"] for chunk in chunks],  # section_title
+        [chunk["metadata"]["kiwix_url"] for chunk in chunks],  # source_url
+        [chunk["content"] for chunk in chunks],  # actual text content of the chunk
+        embeddings.tolist()  # Convert tensor embeddings to list
+    ]
+    
+    # Insert data
+    start_time = time.time()
+    insert_result = collection.insert(data)
+    end_time = time.time()
+    
+    # Confirm insertion
+    print(f"Inserted {len(data[0])} entities into collection '{collection_name}' in {end_time - start_time} seconds.")
+    collection.flush()  # Ensure the data is written to disk
+    print(f"Number of entities in the collection: {collection.num_entities}")
+
+# Main program (modified)
+if __name__ == "__main__":
+    # Fetch the article and sections
+    article_title = "Microsoft Windows"
+    url_prefix = "https://en.wikipedia.org/wiki/"
+    title, sections, article_text = fetch_article(article_title)
+
+    if title and sections:
+        # Initialize tokenizer and model
+        model_name = "mixedbread-ai/mxbai-embed-large-v1"  # Adjust as necessary
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        token_limit = 512  # Token limit for MXBAI embeddings
+
+        # Extract section data
+        section_data = extract_section_content(sections)
+
+        # Chunk the article with accurate section titles
+        chunks = chunk_article_with_metadata(title, section_data, token_limit, tokenizer, url_prefix)
+        print(f"Total Chunks: {len(chunks)}")
+
+        # Print metadata for a few chunks
+        for i, chunk in enumerate(chunks[:3]):  # Print first 3 chunks for brevity
+            print(f"Chunk {i + 1} Metadata: {chunk['metadata']}")
+
+        # Embed the chunks
+        embeddings = embed_chunks(chunks, model_name)
+        print(f"Total Chunks Embedded: {len(embeddings)}")
+
+        # Insert the chunks and embeddings into Milvus
+        insert_into_milvus(chunks, embeddings, collection_name="test_windows")
